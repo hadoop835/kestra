@@ -1,12 +1,20 @@
 package io.kestra.core.http.client;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import dev.failsafe.Failsafe;
+import dev.failsafe.FailsafeException;
+import dev.failsafe.RetryPolicy;
+import dev.failsafe.RetryPolicyBuilder;
 import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.http.HttpRequest;
 import io.kestra.core.http.HttpResponse;
-import io.kestra.core.http.client.apache.*;
+import io.kestra.core.http.client.apache.FailedResponseInterceptor;
+import io.kestra.core.http.client.apache.LoggingRequestInterceptor;
+import io.kestra.core.http.client.apache.LoggingResponseInterceptor;
+import io.kestra.core.http.client.apache.RunContextResponseInterceptor;
 import io.kestra.core.http.client.configurations.HttpConfiguration;
 import io.kestra.core.runners.DefaultRunContext;
+import io.kestra.core.models.tasks.retrys.AbstractRetry;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
 import io.micrometer.common.KeyValues;
@@ -21,7 +29,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hc.client5.http.ContextBuilder;
-import org.apache.hc.client5.http.auth.*;
+import org.apache.hc.client5.http.auth.AuthScope;
+import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.impl.ChainElement;
 import org.apache.hc.client5.http.impl.DefaultAuthenticationStrategy;
@@ -39,6 +48,8 @@ import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.ssl.SSLContexts;
 import org.apache.hc.core5.util.Timeout;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
@@ -46,11 +57,9 @@ import java.net.*;
 import java.security.KeyManagementException;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
-import java.time.Duration;
 import java.util.List;
 import java.util.function.Consumer;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLHandshakeException;
+import java.util.function.Supplier;
 
 @Slf4j
 public class HttpClient implements Closeable {
@@ -75,7 +84,7 @@ public class HttpClient implements Closeable {
             throw new IllegalStateException("Client has already been created");
         }
 
-        org.apache.hc.client5.http.impl.classic.HttpClientBuilder builder = HttpClients.custom()
+        var builder = HttpClients.custom()
             .disableDefaultUserAgent()
             .setUserAgent("Kestra");
 
@@ -89,49 +98,37 @@ public class HttpClient implements Closeable {
         // logger
         if (this.configuration.getLogs() != null && this.configuration.getLogs().length > 0) {
             if (ArrayUtils.contains(this.configuration.getLogs(), HttpConfiguration.LoggingType.REQUEST_HEADERS) ||
-                ArrayUtils.contains(this.configuration.getLogs(), HttpConfiguration.LoggingType.REQUEST_BODY)
-            ) {
+                ArrayUtils.contains(this.configuration.getLogs(), HttpConfiguration.LoggingType.REQUEST_BODY)) {
                 builder.addRequestInterceptorLast(new LoggingRequestInterceptor(runContext.logger(), this.configuration.getLogs()));
             }
-
             if (ArrayUtils.contains(this.configuration.getLogs(), HttpConfiguration.LoggingType.RESPONSE_HEADERS) ||
-                ArrayUtils.contains(this.configuration.getLogs(), HttpConfiguration.LoggingType.RESPONSE_BODY)
-            ) {
+                ArrayUtils.contains(this.configuration.getLogs(), HttpConfiguration.LoggingType.RESPONSE_BODY)) {
                 builder.addResponseInterceptorLast(new LoggingResponseInterceptor(runContext.logger(), this.configuration.getLogs()));
             }
         }
 
-        // Object dependencies
-        PoolingHttpClientConnectionManagerBuilder connectionManagerBuilder = PoolingHttpClientConnectionManagerBuilder.create();
-        ConnectionConfig.Builder connectionConfig = ConnectionConfig.custom();
-        BasicCredentialsProvider credentialsStore = new BasicCredentialsProvider();
+        var connectionManagerBuilder = PoolingHttpClientConnectionManagerBuilder.create();
+        var connectionConfig = ConnectionConfig.custom();
+        var credentialsStore = new BasicCredentialsProvider();
 
-        // Timeout
         if (this.configuration.getTimeout() != null) {
-            var connectTimeout = runContext.render(this.configuration.getTimeout().getConnectTimeout()).as(Duration.class);
+            var connectTimeout = runContext.render(this.configuration.getTimeout().getConnectTimeout()).as(java.time.Duration.class);
             connectTimeout.ifPresent(duration -> connectionConfig.setConnectTimeout(Timeout.of(duration)));
-
-            var readIdleTimeout = runContext.render(this.configuration.getTimeout().getReadIdleTimeout()).as(Duration.class);
+            var readIdleTimeout = runContext.render(this.configuration.getTimeout().getReadIdleTimeout()).as(java.time.Duration.class);
             readIdleTimeout.ifPresent(duration -> connectionConfig.setSocketTimeout(Timeout.of(duration)));
         }
 
-        // proxy
         if (this.configuration.getProxy() != null && configuration.getProxy().getAddress() != null) {
-            String proxyAddress = runContext.render(configuration.getProxy().getAddress()).as(String.class).orElse(null);
+            var proxyAddress = runContext.render(configuration.getProxy().getAddress()).as(String.class).orElse(null);
 
             if (StringUtils.isNotEmpty(proxyAddress)) {
-                int port = runContext.render(configuration.getProxy().getPort()).as(Integer.class).orElseThrow();
-                SocketAddress proxyAddr = new InetSocketAddress(
-                    proxyAddress,
-                    port
-                );
-
-                Proxy proxy = new Proxy(runContext.render(configuration.getProxy().getType()).as(Proxy.Type.class).orElse(null), proxyAddr);
+                var port = runContext.render(configuration.getProxy().getPort()).as(Integer.class).orElseThrow();
+                var proxyAddr = new InetSocketAddress(proxyAddress, port);
+                var proxy = new Proxy(runContext.render(configuration.getProxy().getType()).as(Proxy.Type.class).orElse(null), proxyAddr);
 
                 builder.setProxySelector(new ProxySelector() {
                     @Override
                     public void connectFailed(URI uri, SocketAddress sa, IOException e) {
-                        /* ignore */
                     }
 
                     @Override
@@ -142,7 +139,6 @@ public class HttpClient implements Closeable {
 
                 if (this.configuration.getProxy().getUsername() != null && this.configuration.getProxy().getPassword() != null) {
                     builder.setProxyAuthenticationStrategy(new DefaultAuthenticationStrategy());
-
                     credentialsStore.setCredentials(
                         new AuthScope(proxyAddress, port),
                         new UsernamePasswordCredentials(
@@ -154,19 +150,16 @@ public class HttpClient implements Closeable {
             }
         }
 
-        // ssl
         if (this.configuration.getSsl() != null) {
             if (this.configuration.getSsl().getInsecureTrustAllCertificates() != null) {
                 connectionManagerBuilder.setSSLSocketFactory(this.selfSignedConnectionSocketFactory());
             }
         }
 
-        // auth
         if (this.configuration.getAuth() != null) {
             this.configuration.getAuth().configure(builder, runContext);
         }
 
-        // root options
         if (!runContext.render(this.configuration.getFollowRedirects()).as(Boolean.class).orElseThrow()) {
             builder.disableRedirectHandling();
         }
@@ -176,8 +169,7 @@ public class HttpClient implements Closeable {
         }
 
         if (this.configuration.getAllowedResponseCodes() != null) {
-            List<Integer> list = runContext.render(this.configuration.getAllowedResponseCodes()).asList(Integer.class);
-
+            var list = runContext.render(this.configuration.getAllowedResponseCodes()).asList(Integer.class);
             if (!list.isEmpty()) {
                 builder.addResponseInterceptorLast(new FailedResponseInterceptor(list));
             }
@@ -185,113 +177,115 @@ public class HttpClient implements Closeable {
 
         builder.addResponseInterceptorLast(new RunContextResponseInterceptor(this.runContext));
 
-        // builder object
         connectionManagerBuilder.setDefaultConnectionConfig(connectionConfig.build());
         builder.setConnectionManager(connectionManagerBuilder.build());
         builder.setDefaultCredentialsProvider(credentialsStore);
 
         this.client = builder.build();
-
         return client;
     }
 
     private SSLConnectionSocketFactory selfSignedConnectionSocketFactory() {
         try {
-            SSLContext sslContext = SSLContexts
-                .custom()
-                .loadTrustMaterial(null, (chain, authType) -> true)
-                .build();
-
+            SSLContext sslContext = SSLContexts.custom().loadTrustMaterial(null, (chain, authType) -> true).build();
             return new SSLConnectionSocketFactory(sslContext, NoopHostnameVerifier.INSTANCE);
         } catch (NoSuchAlgorithmException | KeyStoreException | KeyManagementException e) {
             throw new IllegalArgumentException(e);
         }
     }
 
-    /**
-     * Send a request
-     *
-     * @param request the request
-     * @param cls the class of the response
-     * @param <T> the type of response expected
-     * @return the response
-     */
     public <T> HttpResponse<T> request(HttpRequest request, Class<T> cls) throws HttpClientException, IllegalVariableEvaluationException {
-        HttpClientContext httpClientContext = this.clientContext(request);
-
+        var httpClientContext = this.clientContext(request);
         return this.request(request, httpClientContext, r -> {
             T body = bodyHandler(cls, r.getEntity());
-
             return HttpResponse.from(r, body, request, httpClientContext);
         });
     }
 
-    /**
-     * Send a request, getting the response with body as input stream
-     *
-     * @param request the request
-     * @param consumer the consumer of the response
-     * @return the response without the body
-     */
     public HttpResponse<Void> request(HttpRequest request, Consumer<HttpResponse<InputStream>> consumer) throws HttpClientException, IllegalVariableEvaluationException {
-        HttpClientContext httpClientContext = this.clientContext(request);
-
+        var httpClientContext = this.clientContext(request);
         return this.request(request, httpClientContext, r -> {
-            HttpResponse<InputStream> from = HttpResponse.from(
-                r,
-                r.getEntity() != null ? r.getEntity().getContent() : null,
-                request,
-                httpClientContext
-            );
-
+            var from = HttpResponse.from(r, r.getEntity() != null ? r.getEntity().getContent() : null, request, httpClientContext);
             consumer.accept(from);
-
             return HttpResponse.from(r, null, request, httpClientContext);
         });
     }
 
-    /**
-     * Send a request and expect a json response
-     *
-     * @param request the request
-     * @param <T> the type of response expected
-     * @return the response
-     */
     public <T> HttpResponse<T> request(HttpRequest request) throws HttpClientException, IllegalVariableEvaluationException {
-        HttpClientContext httpClientContext = this.clientContext(request);
-
+        var httpClientContext = this.clientContext(request);
         return this.request(request, httpClientContext, response -> {
-            T body = JacksonMapper.ofJson().readValue(response.getEntity().getContent(), new TypeReference<>() {});
-
+            T body = JacksonMapper.ofJson().readValue(response.getEntity().getContent(), new TypeReference<>() {
+            });
             return HttpResponse.from(response, body, request, httpClientContext);
         });
     }
 
     private HttpClientContext clientContext(HttpRequest request) {
-        ContextBuilder contextBuilder = ContextBuilder.create();
-
+        var contextBuilder = ContextBuilder.create();
         return contextBuilder.build();
+    }
+
+    private static Throwable unwrap(Throwable t) {
+        var cur = t;
+        while (cur instanceof RuntimeException && cur.getCause() != null) {
+            cur = cur.getCause();
+        }
+        return cur;
     }
 
     private <T> HttpResponse<T> request(
         HttpRequest request,
         HttpClientContext httpClientContext,
         HttpClientResponseHandler<HttpResponse<T>> responseHandler
-    ) throws HttpClientException {
+    ) throws HttpClientException, IllegalVariableEvaluationException {
+
+        var retryableCodes = runContext.render(configuration.getRetryOnStatusCodes()).asList(Integer.class);
+
+        @SuppressWarnings("unchecked")
+        RetryPolicyBuilder<HttpResponse<T>> policyBuilder = AbstractRetry.retryPolicy(configuration.getRetry());
+
+        policyBuilder
+            .handleIf(throwable -> {
+                var th = unwrap(throwable);
+                if (th instanceof HttpClientResponseException ex) {
+                    var code = ex.getResponse().getStatus().getCode();
+                    return retryableCodes.contains(code);
+                }
+                if (th instanceof HttpClientRequestException) return true;
+                return th instanceof SocketException;
+            })
+            .onRetry(e -> {
+                var th = unwrap(e.getLastException());
+                var msg = th == null ? "unknown" : th.getMessage();
+                log.warn("HTTP retry attempt {} due to {}", e.getAttemptCount(), msg);
+            });
+
+        RetryPolicy<HttpResponse<T>> policy = policyBuilder.build();
+
+        Supplier<HttpResponse<T>> supplier = () -> {
+            try {
+                return this.client.execute(request.to(runContext), httpClientContext, responseHandler);
+            } catch (SocketException e) {
+                throw new RuntimeException(new HttpClientRequestException(e.getMessage(), request, e));
+            } catch (IOException e) {
+                if (e instanceof SSLHandshakeException) {
+                    throw new RuntimeException(new HttpClientRequestException(e.getMessage(), request, e));
+                }
+                if (e.getCause() instanceof HttpClientException httpClientException) {
+                    throw new RuntimeException(httpClientException);
+                }
+                throw new RuntimeException(e);
+            }
+        };
+
         try {
-            return this.client.execute(request.to(runContext), httpClientContext, responseHandler);
-        } catch (SocketException e) {
-            throw new HttpClientRequestException(e.getMessage(), request, e);
-        } catch (IOException e) {
-            if (e instanceof SSLHandshakeException) {
-                throw new HttpClientRequestException(e.getMessage(), request, e);
-            }
-
-            if (e.getCause() instanceof HttpClientException httpClientException) {
-                throw httpClientException;
-            }
-
-            throw new RuntimeException(e);
+            return Failsafe.with(policy).get(supplier::get);
+        } catch (FailsafeException fe) {
+            var cause = unwrap(fe.getCause());
+            if (cause instanceof HttpClientException hce) throw hce;
+            if (cause instanceof RuntimeException re && re.getCause() instanceof HttpClientException hce2) throw hce2;
+            if (cause instanceof RuntimeException re) throw re;
+            throw new RuntimeException(cause);
         }
     }
 
